@@ -27,10 +27,15 @@ import argparse
 import logging
 import os
 
-from models import DiT_models
+from models import DiT_models, add_pos
 from diffusion import create_diffusion
-from diffusers.models import AutoencoderKL
+# from diffusers.models import AutoencoderKL
 
+# Setup DDP JZ:
+import idr_torch
+
+# args = {'model': 'DiT-XL/8', 'image_size': 256, 'global_seed': 0}
+# srun -- python train.py          --model DiT-XL/8               --data-path /gpfsdswork/dataset/imagenet/train                    --global-batch-size 128                         --image-size 256
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -113,14 +118,26 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
+    # # Setup DDP JZ:
+    dist.init_process_group(backend='nccl',
+                            init_method='env://',
+                            world_size=idr_torch.size,
+                            rank=idr_torch.rank)
+    torch.cuda.set_device(idr_torch.local_rank)
+    rank = idr_torch.local_rank
+    print(f"Starting rank={rank}, world_size={idr_torch.size}.")
+    device = idr_torch.rank % torch.cuda.device_count() 
+    seed = args.global_seed * idr_torch.size + idr_torch.rank
     torch.manual_seed(seed)
-    torch.cuda.set_device(device)
+    
+    # # Setup DDP:
+    # dist.init_process_group("nccl")
+    # assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    # rank = dist.get_rank()
+    # device = rank % torch.cuda.device_count()
+    # seed = args.global_seed * dist.get_world_size() + rank
+    # torch.manual_seed(seed)
+    # torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
     # Setup an experiment folder:
@@ -136,24 +153,46 @@ def main(args):
     else:
         logger = create_logger(None)
 
+    if rank == 0 and args.load_ckpt:
+        model_checkpoint = torch.load(args.load_ckpt, map_location='cpu')
+        
     # Create model:
-    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.image_size // 8
+    # assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    # latent_size = args.image_size // 8
+    latent_size = args.image_size
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes
     )
     # Note that parameter initialization is done within the DiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    if rank == 0 and args.load_ckpt:
+        model.load_state_dict(model_checkpoint["model"]) # model loaded on cpu
+        ema = deepcopy(model)  # Create an EMA of the model for use after training
+        ema.load_state_dict(model_checkpoint["ema"]) # model loaded on cpu
+        del model_checkpoint
+    else:
+        ema = deepcopy(model)  # Create an EMA of the model for use after training
+
+    model = model.to(device)
+    ema = ema.to(device)
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+
+    model = DDP(model, device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
-
+    if args.load_ckpt:
+        optim_checkpoint = torch.load(args.load_ckpt[:-3] + '_optim.pt')
+        opt.load_state_dict(optim_checkpoint["opt"])
+        train_steps = optim_checkpoint["train_steps"]
+        del optim_checkpoint
+        torch.cuda.empty_cache()
+    else:
+        train_steps = 0
+        
     # Setup data:
     transform = transforms.Compose([
         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
@@ -164,14 +203,17 @@ def main(args):
     dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
+        # num_replicas=dist.get_world_size(),
+        # rank=rank,
+        num_replicas=idr_torch.size,
+        rank=idr_torch.rank,
         shuffle=True,
         seed=args.global_seed
     )
     loader = DataLoader(
         dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
+        # batch_size=int(args.global_batch_size // dist.get_world_size()),
+        batch_size=int(args.global_batch_size // idr_torch.size),
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
@@ -186,7 +228,7 @@ def main(args):
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+
     log_steps = 0
     running_loss = 0
     start_time = time()
@@ -196,11 +238,14 @@ def main(args):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            # x = x.to(device)
+            # y = y.to(device)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            # with torch.no_grad():
+            #     # Map input images to latent space + normalize latents:
+            #     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            x = add_pos(x)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -232,16 +277,29 @@ def main(args):
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
-                    checkpoint = {
+                    model_checkpoint = {
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args
+                        "args": args,
+                        "train_steps": train_steps,
+                        "epoch": epoch,
                     }
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    optim_checkpoint = {
+                        "opt": opt.state_dict(),
+                        "args": args,
+                        "train_steps": train_steps,
+                        "epoch": epoch,
+                    }
+                    model_checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    optim_checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}_optim.pt"
+                    torch.save(model_checkpoint, model_checkpoint_path)
+                    logger.info(f"Saved model checkpoint to {model_checkpoint_path}")
+                    torch.save(optim_checkpoint, optim_checkpoint_path)
+                    logger.info(f"Saved optim checkpoint to {optim_checkpoint_path}")
+                    torch.save(model_checkpoint, f"{checkpoint_dir}/latest.pt")
+                    torch.save(optim_checkpoint, f"{checkpoint_dir}/latest_optim.pt")
                 dist.barrier()
+                exit() # for JZ
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -256,14 +314,15 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, choices=[32, 64, 128, 256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    # parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--load-ckpt", type=str)
     args = parser.parse_args()
     main(args)
